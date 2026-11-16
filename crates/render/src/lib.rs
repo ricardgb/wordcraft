@@ -272,6 +272,33 @@ impl Default for RenderOptions {
     }
 }
 
+/// A document picture's pixels as the page renderer draws them: decoded, its brightness and
+/// contrast applied, premultiplied RGBA8, shared with the renderer's cache.
+#[derive(Clone)]
+pub struct PicturePixels(Arc<Pixmap>);
+
+impl PicturePixels {
+    pub fn width(&self) -> u32 {
+        self.0.width() as u32
+    }
+    pub fn height(&self) -> u32 {
+        self.0.height() as u32
+    }
+    /// Premultiplied RGBA8, row by row.
+    pub fn rgba(&self) -> &[u8] {
+        self.0.data_as_u8_slice()
+    }
+}
+
+/// The pixels the page renderer draws for picture `media` with `fx`: `None` for a metafile
+/// (drawn as vectors) or a picture that can't be decoded.
+pub fn picture_pixels(doc: &Document, media: &str, fx: wordcraft_doc::picfx::PicFx) -> Option<PicturePixels> {
+    if vector_for(doc, media).is_some() {
+        return None;
+    }
+    pixmap_for(doc, media, fx).map(PicturePixels)
+}
+
 /// Render a whole page at `scale` pixels per point.
 pub fn render_page(doc: &Document, page: &Page, scale: f32, opts: &RenderOptions) -> Rendered {
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };

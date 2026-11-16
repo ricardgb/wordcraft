@@ -94,6 +94,9 @@ pub struct CanvasState {
     textures: HashMap<usize, (u64, TextureHandle)>,
     /// Visible full-resolution tiles of pages too tall for one GPU texture.
     tiles: HashMap<(usize, usize), (u64, TextureHandle)>,
+    /// Pages as vector drawing for a host that asked for them ([`crate::host_pages`]): the
+    /// content key, the page, and whether the host took it.
+    vectors: HashMap<usize, (u64, std::sync::Arc<crate::host_pages::PageVector>, bool)>,
     /// Page content fingerprints of the current layout, for the texture cache (#811).
     pub(crate) page_keys: PageKeys,
     /// Whether the document has tracked formatting changes, moves and deletions, by document
@@ -352,6 +355,7 @@ impl Default for CanvasState {
         CanvasState {
             textures: HashMap::new(),
             tiles: HashMap::new(),
+            vectors: HashMap::new(),
             page_keys: PageKeys::default(),
             markup_facts: std::cell::Cell::new(None),
             scroll_to_caret: true,
@@ -901,6 +905,10 @@ fn paint_pages(pass: PagePaint<'_>) -> PagePaintOutput {
     let mut visible_tile_keys = HashSet::new();
     let mut rendered = 0;
     let mut rects = Vec::with_capacity(geo.rects.len());
+    let hook = crate::host_pages::PageVectorHook::get(ui.ctx());
+    if hook.is_none() {
+        app.canvas.vectors.clear();
+    }
     for (i, pr) in geo.rects.iter().enumerate() {
         let sr = pr.translate(content_origin.to_vec2());
         let Some(page) = layout.pages.get(i) else { continue };
@@ -915,6 +923,29 @@ fn paint_pages(pass: PagePaint<'_>) -> PagePaintOutput {
         let band_of = |r: Rect| Rect::from_min_max(pos2(r.min.x - 4.0, r.min.y + band_top), pos2(r.max.x + 4.0, r.min.y + band_bot));
         let visible = band_of(sr).intersects(ui.clip_rect().expand(200.0));
         // Only pages on screen or with a texture need their key (#811).
+        // A host that draws pages itself (crate::host_pages) is offered each visible page.
+        let vector = if visible && let Some(hook) = &hook {
+            let vkey = page_key(app, layout, i, view, 0.0);
+            match app.canvas.vectors.get(&i) {
+                Some((k, v, ok)) if *k == vkey => ok.then(|| v.clone()),
+                _ => {
+                    let mut opts = page_render_options(app, dim_body);
+                    opts.display.hide_object = hidden.as_ref().filter(|(page, _)| *page == i).map(|(_, p)| p.clone());
+                    let v = std::sync::Arc::new(crate::host_pages::page_vector(page_doc(app), page, &opts));
+                    let ok = (hook.accepts)(&v);
+                    app.canvas.vectors.insert(i, (vkey, v.clone(), ok));
+                    ok.then_some(v)
+                }
+            }
+        } else {
+            None
+        };
+        // Without the raster: the host draws this page, and nothing else shows egui's meshes.
+        let no_raster = vector.is_some() && !hook.as_ref().is_some_and(|h| h.raster_too);
+        if no_raster {
+            app.canvas.textures.remove(&i);
+        }
+        let tiled = tiled && !no_raster;
         let cached = !tiled && app.canvas.textures.contains_key(&i);
         let key =
             if visible || cached { page_key(app, layout, i, view, scale_px) ^ if tiled { (tile_height_px as u64) << 32 } else { 0 } } else { 0 };
@@ -924,7 +955,7 @@ fn paint_pages(pass: PagePaint<'_>) -> PagePaintOutput {
         let forced = hidden.as_ref().is_some_and(|(page, _)| *page == i);
         // Render before placing the page: a page re-rendered in this frame (a zoom step, an
         // edit) then sits on the pixel grid in this frame too, rather than a frame later.
-        if visible && !tiled && !fresh && (forced || rendered < 2 || !app.canvas.textures.contains_key(&i) && rendered < 4) {
+        if visible && !no_raster && !tiled && !fresh && (forced || rendered < 2 || !app.canvas.textures.contains_key(&i) && rendered < 4) {
             let mut opts = page_render_options(app, dim_body);
             // Only on the page it is on: the `Pos` can't match an object of another page.
             opts.display.hide_object = hidden.as_ref().filter(|(page, _)| *page == i).map(|(_, p)| p.clone());
@@ -942,7 +973,7 @@ fn paint_pages(pass: PagePaint<'_>) -> PagePaintOutput {
             }
             rendered += 1;
             fresh = true;
-        } else if visible && !tiled && !fresh {
+        } else if visible && !no_raster && !tiled && !fresh {
             ui.ctx().request_repaint();
         }
         let current_scale = geo.scale * ppp;
@@ -961,6 +992,9 @@ fn paint_pages(pass: PagePaint<'_>) -> PagePaintOutput {
         // Shadow and paper.
         painter.rect_filled(visual_sr.translate(vec2(0.0, 2.0)).expand(1.5), 1.0, t.page_shadow);
         painter.rect_filled(visual_sr, 0.0, paper);
+        // The host's page goes here, over the paper; the textures drawn below for it are named.
+        let vector_slot = vector.as_ref().map(|_| painter.add(egui::Shape::Noop));
+        let mut raster_ids = Vec::new();
         if tiled {
             // Render before painting to keep the frame sharp immediately after an edit or
             // zoom. Tiles are fixed to raster-pixel boundaries, independent of scrolling.
@@ -1011,12 +1045,18 @@ fn paint_pages(pass: PagePaint<'_>) -> PagePaintOutput {
                         vec2(tex.size_vec2().x * screen_per_raster_px, height_px as f32 * screen_per_raster_px),
                     );
                     painter.image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    raster_ids.push(tex.id());
                 }
             }
-        } else if let Some((_, tex)) = app.canvas.textures.get(&i) {
+        } else if !no_raster && let Some((_, tex)) = app.canvas.textures.get(&i) {
             painter.image(tex.id(), visual_sr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            raster_ids.push(tex.id());
         }
         let page_scale = page_screen_scale(visual_sr, page, geo.scale);
+        if let (Some(slot), Some(v)) = (vector_slot, vector) {
+            let cb = crate::host_pages::PageCallback { page: v, origin: visual_sr.min, scale: page_scale, raster: raster_ids };
+            painter.set(slot, egui::Shape::Callback(egui::PaintCallback { rect: visual_sr, callback: std::sync::Arc::new(cb) }));
+        }
         // Header/footer editing chrome.
         if let StoryRef::Part(id) = app.session.sel.focus.story {
             let sect_body = page.body;
@@ -1433,6 +1473,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         let near = clip.expand2(vec2(clip.width(), clip.height() * TEXTURE_KEEP_SCREENS));
         app.canvas.textures.retain(|k, _| *k < n && geo.rects.get(*k).is_some_and(|r| r.translate(content_origin.to_vec2()).intersects(near)));
         app.canvas.tiles.retain(|id, _| visible_tile_keys.contains(id));
+        app.canvas.vectors.retain(|k, _| *k < n && geo.rects.get(*k).is_some_and(|r| r.translate(content_origin.to_vec2()).intersects(near)));
         app.canvas.page_rects = rects.clone();
         let view_rect = ui.clip_rect();
         if floating_comments(app) {
